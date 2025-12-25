@@ -24,7 +24,10 @@ class ScaleStore:
 
         self._cache = {}
         self._cache_order = deque()
-        self._cache_cap = 4
+        self._cache_cap = 8
+
+    def ts_of_idx(self, idx: int) -> int:
+        return int(self.first_ts + int(idx) * int(self.interval_ms))
 
     def _find_shard(self, idx: int):
         i = bisect.bisect_right(self.offsets, idx) - 1
@@ -39,36 +42,43 @@ class ScaleStore:
             return self._cache[shard_i]
         shard = self.shards[shard_i]
         X = np.load(shard["x"], mmap_mode="r")
-        T = np.load(shard["t"], mmap_mode="r")
-        self._cache[shard_i] = (X, T)
+        self._cache[shard_i] = X
 
         self._cache_order.append(shard_i)
         while len(self._cache_order) > self._cache_cap:
             old = self._cache_order.popleft()
             if old in self._cache:
                 del self._cache[old]
-        return X, T
+        return X
 
     def get_row(self, idx: int):
         shard_i, local = self._find_shard(idx)
-        X, T = self._load_memmap(shard_i)
-        return int(T[local]), X[local]
+        X = self._load_memmap(shard_i)
+        return self.ts_of_idx(idx), X[local]
 
     def get_seq_end(self, idx_end: int, seq_len: int):
         start = idx_end - (seq_len - 1)
         if start < 0:
             raise IndexError("seq start < 0")
 
+        sh_e, lo_e = self._find_shard(idx_end)
+        sh_s, lo_s = self._find_shard(start)
+
+        if sh_s == sh_e:
+            X = self._load_memmap(sh_e)
+            return X[lo_s:lo_e + 1]
+
         out = np.empty((seq_len, self.d), dtype=np.float32)
-        cur = start
-        filled = 0
-        while cur <= idx_end:
-            shard_i, local = self._find_shard(cur)
-            X, _ = self._load_memmap(shard_i)
-            take = min(X.shape[0] - local, (idx_end - cur + 1))
-            out[filled:filled + take] = X[local:local + take]
-            filled += take
-            cur += take
+
+        Xs = self._load_memmap(sh_s)
+        take1 = Xs.shape[0] - lo_s
+        if take1 > seq_len:
+            take1 = seq_len
+        out[:take1] = Xs[lo_s:lo_s + take1]
+
+        Xe = self._load_memmap(sh_e)
+        need = seq_len - take1
+        out[take1:] = Xe[:need]
         return out
 
 
@@ -92,7 +102,6 @@ def map_base_ts_to_scale_idx(scale_store: ScaleStore, t_ms: int):
         return -1
     return int((int(t_ms) - int(scale_store.first_ts)) // int(scale_store.interval_ms))
 
-
 # =========================
 # ENVIRONMENT
 # =========================
@@ -110,9 +119,12 @@ def vote_exec_action(vote_deque: deque, last_exec: int):
 
 
 class TradingEnv:
-    def __init__(self, stores, norm, close_idx_in_x250: int):
+    def __init__(self, stores, norm, close_idx_in_x250: int, device: str, torch_obs: bool = True):
         self.stores = stores
         self.close_idx = int(close_idx_in_x250)
+        self.device = device
+        self.torch_obs = bool(torch_obs)
+
         self.episode_steps = int((EPISODE_HOURS * 3600 * 1000) // BASE_MS)
 
         self.mean = {k: np.array(norm[k]["mean"], dtype=np.float32) for k in norm}
@@ -120,7 +132,7 @@ class TradingEnv:
 
         self.i = 0
         self.step_i = 0
-        self.balance = INIT_BALANCE
+        self.balance = float(INIT_BALANCE)
         self.pos = 0
         self.vote = deque(maxlen=VOTE_N)
         self.last_exec = 0
@@ -130,6 +142,11 @@ class TradingEnv:
         self.buf_20 = None
         self.buf_5m = None
         self.buf_1h = None
+
+        self.tbuf_250 = None
+        self.tbuf_20 = None
+        self.tbuf_5m = None
+        self.tbuf_1h = None
 
         self.idx_20 = 0
         self.idx_5m = 0
@@ -168,13 +185,23 @@ class TradingEnv:
         return ctx
 
     def _obs(self):
-        return {
-            "250ms": self.buf_250,
-            "20s": self.buf_20,
-            "5m": self.buf_5m,
-            "1h": self.buf_1h,
-            "ctx": self._ctx_vec()
-        }
+        if self.torch_obs:
+            return {"250ms": self.tbuf_250, "20s": self.tbuf_20, "5m": self.tbuf_5m, "1h": self.tbuf_1h, "ctx": self._ctx_vec()}
+        return {"250ms": self.buf_250, "20s": self.buf_20, "5m": self.buf_5m, "1h": self.buf_1h, "ctx": self._ctx_vec()}
+
+    def _sync_tbuf_full(self):
+        self.tbuf_250 = torch.from_numpy(self.buf_250).unsqueeze(0).to(self.device, dtype=DTYPE)
+        self.tbuf_20 = torch.from_numpy(self.buf_20).unsqueeze(0).to(self.device, dtype=DTYPE)
+        self.tbuf_5m = torch.from_numpy(self.buf_5m).unsqueeze(0).to(self.device, dtype=DTYPE)
+        self.tbuf_1h = torch.from_numpy(self.buf_1h).unsqueeze(0).to(self.device, dtype=DTYPE)
+
+    def _shift_append_numpy(self, buf: np.ndarray, row: np.ndarray):
+        buf[:-1] = buf[1:]
+        buf[-1] = row
+
+    def _shift_append_torch(self, tbuf: torch.Tensor, row_np: np.ndarray):
+        tbuf.copy_(torch.roll(tbuf, shifts=-1, dims=1))
+        tbuf[:, -1] = torch.from_numpy(row_np).to(self.device, dtype=DTYPE)
 
     def reset(self, start_i):
         self.i = int(start_i)
@@ -187,7 +214,9 @@ class TradingEnv:
         self.last_exec = 0
         self.done = False
 
-        t_ms, _ = self.stores["250ms"].get_row(self.i)
+        base_store = self.stores["250ms"]
+        t_ms = base_store.ts_of_idx(self.i)
+
         self.idx_20 = map_base_ts_to_scale_idx(self.stores["20s"], t_ms)
         self.idx_5m = map_base_ts_to_scale_idx(self.stores["5m"], t_ms)
         self.idx_1h = map_base_ts_to_scale_idx(self.stores["1h"], t_ms)
@@ -197,10 +226,13 @@ class TradingEnv:
         x5m = self.stores["5m"].get_seq_end(self.idx_5m, SEQ_LEN)
         x1h = self.stores["1h"].get_seq_end(self.idx_1h, SEQ_LEN)
 
-        self.buf_250 = self._norm_scale("250ms", x250)
-        self.buf_20 = self._norm_scale("20s", x20)
-        self.buf_5m = self._norm_scale("5m", x5m)
-        self.buf_1h = self._norm_scale("1h", x1h)
+        self.buf_250 = self._norm_scale("250ms", x250).astype(np.float32, copy=False)
+        self.buf_20 = self._norm_scale("20s", x20).astype(np.float32, copy=False)
+        self.buf_5m = self._norm_scale("5m", x5m).astype(np.float32, copy=False)
+        self.buf_1h = self._norm_scale("1h", x1h).astype(np.float32, copy=False)
+
+        if self.torch_obs:
+            self._sync_tbuf_full()
 
         return self._obs()
 
@@ -274,36 +306,41 @@ class TradingEnv:
         self.i = next_i
         self.step_i += 1
 
-        t_ms, _ = self.stores["250ms"].get_row(self.i)
+        base_store = self.stores["250ms"]
+        t_ms = base_store.ts_of_idx(self.i)
 
         new_idx_20 = map_base_ts_to_scale_idx(self.stores["20s"], t_ms)
         new_idx_5m = map_base_ts_to_scale_idx(self.stores["5m"], t_ms)
         new_idx_1h = map_base_ts_to_scale_idx(self.stores["1h"], t_ms)
 
-        row250 = self._norm_row("250ms", x_next_row)
-        self.buf_250 = np.roll(self.buf_250, shift=-1, axis=0)
-        self.buf_250[-1] = row250
+        row250 = self._norm_row("250ms", x_next_row).astype(np.float32, copy=False)
+        self._shift_append_numpy(self.buf_250, row250)
+        if self.torch_obs:
+            self._shift_append_torch(self.tbuf_250, row250)
 
         if new_idx_20 != self.idx_20:
             self.idx_20 = new_idx_20
             _, x20row = self.stores["20s"].get_row(self.idx_20)
-            x20row = self._norm_row("20s", x20row)
-            self.buf_20 = np.roll(self.buf_20, shift=-1, axis=0)
-            self.buf_20[-1] = x20row
+            row20 = self._norm_row("20s", x20row).astype(np.float32, copy=False)
+            self._shift_append_numpy(self.buf_20, row20)
+            if self.torch_obs:
+                self._shift_append_torch(self.tbuf_20, row20)
 
         if new_idx_5m != self.idx_5m:
             self.idx_5m = new_idx_5m
             _, x5mrow = self.stores["5m"].get_row(self.idx_5m)
-            x5mrow = self._norm_row("5m", x5mrow)
-            self.buf_5m = np.roll(self.buf_5m, shift=-1, axis=0)
-            self.buf_5m[-1] = x5mrow
+            row5m = self._norm_row("5m", x5mrow).astype(np.float32, copy=False)
+            self._shift_append_numpy(self.buf_5m, row5m)
+            if self.torch_obs:
+                self._shift_append_torch(self.tbuf_5m, row5m)
 
         if new_idx_1h != self.idx_1h:
             self.idx_1h = new_idx_1h
             _, x1hrow = self.stores["1h"].get_row(self.idx_1h)
-            x1hrow = self._norm_row("1h", x1hrow)
-            self.buf_1h = np.roll(self.buf_1h, shift=-1, axis=0)
-            self.buf_1h[-1] = x1hrow
+            row1h = self._norm_row("1h", x1hrow).astype(np.float32, copy=False)
+            self._shift_append_numpy(self.buf_1h, row1h)
+            if self.torch_obs:
+                self._shift_append_torch(self.tbuf_1h, row1h)
 
         thresh = float(LOSS_THRESHOLD_FRAC) * float(INIT_BALANCE)
         done = False
@@ -322,34 +359,64 @@ class TradingEnv:
         self.done = done
         info = {"balance": float(self.balance), "pos": int(self.pos), "exec_action": int(self.last_exec)}
         return self._obs(), reward, done, info
-
-
+    
+    
 # =========================
 # REPLAY
 # =========================
 class ReplayBuffer:
-    def __init__(self, cap: int, ctx_dim: int):
+    def __init__(self, cap: int, ctx_dim: int, replay_dir: Path):
         self.cap = int(cap)
         self.ctx_dim = int(ctx_dim)
-        self.ptr = 0
-        self.size = 0
+        self.replay_dir = Path(replay_dir)
+        self.replay_dir.mkdir(parents=True, exist_ok=True)
+        self.meta_path = self.replay_dir / "replay_meta.json"
 
-        self.i = np.zeros(self.cap, dtype=np.int64)
-        self.a = np.zeros(self.cap, dtype=np.int64)
-        self.r = np.zeros(self.cap, dtype=np.float32)
-        self.d = np.zeros(self.cap, dtype=np.float32)
-        self.ni = np.zeros(self.cap, dtype=np.int64)
+        def mm(path: Path, dtype, shape, mode):
+            return np.memmap(str(path), dtype=dtype, mode=mode, shape=shape)
 
-        self.ctx = np.zeros((self.cap, self.ctx_dim), dtype=np.float32)
-        self.nctx = np.zeros((self.cap, self.ctx_dim), dtype=np.float32)
+        if self.meta_path.exists():
+            with self.meta_path.open("r") as f:
+                meta = json.load(f)
+            if int(meta["cap"]) != self.cap or int(meta["ctx_dim"]) != self.ctx_dim:
+                raise RuntimeError("Replay memmap shape mismatch")
+            self.ptr = int(meta["ptr"])
+            self.size = int(meta["size"])
+            mode = "r+"
+        else:
+            self.ptr = 0
+            self.size = 0
+            mode = "w+"
 
-    def add(self, i, a, r, d, ni, ctx, nctx):
+        self.i = mm(self.replay_dir / "i.dat", np.int64, (self.cap,), mode)
+        self.a = mm(self.replay_dir / "a.dat", np.int64, (self.cap,), mode)
+        self.r = mm(self.replay_dir / "r.dat", np.float32, (self.cap,), mode)
+        self.d = mm(self.replay_dir / "d.dat", np.float32, (self.cap,), mode)
+        self.ctx = mm(self.replay_dir / "ctx.dat", np.float32, (self.cap, self.ctx_dim), mode)
+        self.nctx = mm(self.replay_dir / "nctx.dat", np.float32, (self.cap, self.ctx_dim), mode)
+
+        self._save_meta()
+
+    def _save_meta(self):
+        meta = {"cap": int(self.cap), "ctx_dim": int(self.ctx_dim), "ptr": int(self.ptr), "size": int(self.size)}
+        with self.meta_path.open("w") as f:
+            json.dump(meta, f)
+
+    def flush(self):
+        self.i.flush()
+        self.a.flush()
+        self.r.flush()
+        self.d.flush()
+        self.ctx.flush()
+        self.nctx.flush()
+        self._save_meta()
+
+    def add(self, i, a, r, d, ctx, nctx):
         p = self.ptr
         self.i[p] = int(i)
         self.a[p] = int(a)
         self.r[p] = float(r)
         self.d[p] = float(d)
-        self.ni[p] = int(ni)
         self.ctx[p] = ctx.astype(np.float32, copy=False)
         self.nctx[p] = nctx.astype(np.float32, copy=False)
         self.ptr = (self.ptr + 1) % self.cap
@@ -358,11 +425,15 @@ class ReplayBuffer:
     def sample(self, batch: int):
         idx = np.random.randint(0, self.size, size=int(batch))
         return (
-            self.i[idx],
-            self.a[idx],
-            self.r[idx],
-            self.d[idx],
-            self.ni[idx],
-            self.ctx[idx],
-            self.nctx[idx],
+            self.i[idx].copy(),
+            self.a[idx].copy(),
+            self.r[idx].copy(),
+            self.d[idx].copy(),
+            self.ctx[idx].copy(),
+            self.nctx[idx].copy(),
         )
+
+    def set_state(self, ptr: int, size: int):
+        self.ptr = int(ptr)
+        self.size = int(size)
+        self._save_meta()

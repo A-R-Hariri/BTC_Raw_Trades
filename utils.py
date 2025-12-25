@@ -11,12 +11,6 @@ from config import *
 
 
 # =========================
-# HELPERS
-# =========================
-def count_params(m: torch.nn.Module) -> int:
-    return sum(p.numel() for p in m.parameters())
-
-# =========================
 # REPRO
 # =========================
 def seed_all(seed: int):
@@ -24,6 +18,38 @@ def seed_all(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+# =========================
+# HELPERS
+# =========================
+def count_params(m: torch.nn.Module) -> int:
+    return sum(p.numel() for p in m.parameters())
+
+
+def first_idx_ge_regular(first_ts: int, interval_ms: int, total_rows: int, target_ms: int) -> int:
+    if target_ms <= first_ts:
+        return 0
+    dt = target_ms - first_ts
+    idx = (dt + interval_ms - 1) // interval_ms
+    if idx < 0:
+        return 0
+    if idx > total_rows:
+        return total_rows
+    return int(idx)
+
+
+def save_checkpoint(path: Path, state: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
+def load_checkpoint(path: Path, device: str):
+    ckpt = torch.load(path, map_location=device)
+    return ckpt
+
 
 # =========================
 # TIME UTILS
@@ -63,14 +89,12 @@ def list_sorted_files(folder: Path, kind: str):
     files.sort(key=lambda x: x[0])
     return files
 
-
 def filter_files_by_date(files_with_date, start_date: str, end_date: str):
     out = []
     for d, p in files_with_date:
         if start_date <= d <= end_date:
             out.append(p)
     return out
-
 
 def read_first_data_row_csv(path: Path):
     with path.open("r", newline="") as f:
@@ -83,7 +107,6 @@ def read_first_data_row_csv(path: Path):
                 continue
             return row
     return None
-
 
 def read_last_data_row_csv(path: Path, max_bytes: int = 4_000_000):
     with path.open("rb") as f:

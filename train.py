@@ -16,49 +16,152 @@ from env import *
 # TRAIN
 # =========================
 @torch.no_grad()
-def select_action(actor: ActorNet, obs, device: str):
-    s250 = torch.tensor(obs["250ms"][None], device=device, dtype=DTYPE)
-    s20 = torch.tensor(obs["20s"][None], device=device, dtype=DTYPE)
-    s5m = torch.tensor(obs["5m"][None], device=device, dtype=DTYPE)
-    s1h = torch.tensor(obs["1h"][None], device=device, dtype=DTYPE)
-    ctx = torch.tensor(obs["ctx"][None], device=device, dtype=DTYPE)
+def select_action(actor: ActorNet, obs, device: str, deterministic: bool = False):
+    s250 = obs["250ms"]
+    s20 = obs["20s"]
+    s5m = obs["5m"]
+    s1h = obs["1h"]
+
+    if not torch.is_tensor(s250):
+        s250 = torch.from_numpy(s250).unsqueeze(0).to(device, dtype=DTYPE)
+        s20 = torch.from_numpy(s20).unsqueeze(0).to(device, dtype=DTYPE)
+        s5m = torch.from_numpy(s5m).unsqueeze(0).to(device, dtype=DTYPE)
+        s1h = torch.from_numpy(s1h).unsqueeze(0).to(device, dtype=DTYPE)
+
+    ctx = torch.from_numpy(obs["ctx"]).unsqueeze(0).to(device, dtype=DTYPE)
+
     logits = actor(s250, s20, s5m, s1h, ctx)
+    if deterministic:
+        return int(torch.argmax(logits, dim=-1).item())
     dist = torch.distributions.Categorical(logits=logits)
     return int(dist.sample().item())
 
 
-def load_batch_seqs(stores, idx_end_arr, seq_len):
-    b = len(idx_end_arr)
+def load_batch_s_and_ns(stores, i_arr, seq_len):
+    b = len(i_arr)
 
-    s250 = np.empty((b, seq_len, stores["250ms"].d), dtype=np.float32)
-    s20 = np.empty((b, seq_len, stores["20s"].d), dtype=np.float32)
-    s5m = np.empty((b, seq_len, stores["5m"].d), dtype=np.float32)
-    s1h = np.empty((b, seq_len, stores["1h"].d), dtype=np.float32)
+    d250 = stores["250ms"].d
+    d20 = stores["20s"].d
+    d5m = stores["5m"].d
+    d1h = stores["1h"].d
+
+    s250 = np.empty((b, seq_len, d250), dtype=np.float32)
+    s20 = np.empty((b, seq_len, d20), dtype=np.float32)
+    s5m = np.empty((b, seq_len, d5m), dtype=np.float32)
+    s1h = np.empty((b, seq_len, d1h), dtype=np.float32)
+
+    ns250 = np.empty_like(s250)
+    ns20 = np.empty_like(s20)
+    ns5m = np.empty_like(s5m)
+    ns1h = np.empty_like(s1h)
+
+    base = stores["250ms"]
+    s20s = stores["20s"]
+    s5s = stores["5m"]
+    s1s = stores["1h"]
+
+    base_dt = int(base.interval_ms)
+    f20 = int(s20s.first_ts)
+    f5 = int(s5s.first_ts)
+    f1 = int(s1s.first_ts)
+    dt20 = int(s20s.interval_ms)
+    dt5 = int(s5s.interval_ms)
+    dt1 = int(s1s.interval_ms)
 
     for k in range(b):
-        i250 = int(idx_end_arr[k])
-        t_ms, _ = stores["250ms"].get_row(i250)
+        i = int(i_arr[k])
+        t_ms = base.ts_of_idx(i)
+        t_next = t_ms + base_dt
 
-        i20 = map_base_ts_to_scale_idx(stores["20s"], t_ms)
-        i5m = map_base_ts_to_scale_idx(stores["5m"], t_ms)
-        i1h = map_base_ts_to_scale_idx(stores["1h"], t_ms)
+        i20 = int((t_ms - f20) // dt20)
+        i5 = int((t_ms - f5) // dt5)
+        i1 = int((t_ms - f1) // dt1)
 
-        s250[k] = stores["250ms"].get_seq_end(i250, seq_len)
+        i20n = int((t_next - f20) // dt20)
+        i5n = int((t_next - f5) // dt5)
+        i1n = int((t_next - f1) // dt1)
+
+        s250[k] = stores["250ms"].get_seq_end(i, seq_len)
         s20[k] = stores["20s"].get_seq_end(i20, seq_len)
-        s5m[k] = stores["5m"].get_seq_end(i5m, seq_len)
-        s1h[k] = stores["1h"].get_seq_end(i1h, seq_len)
+        s5m[k] = stores["5m"].get_seq_end(i5, seq_len)
+        s1h[k] = stores["1h"].get_seq_end(i1, seq_len)
 
-    return s250, s20, s5m, s1h
+        ni = i + 1
+        _, r250 = stores["250ms"].get_row(ni)
+        ns250[k, :-1] = s250[k, 1:]
+        ns250[k, -1] = r250
+
+        if i20n == i20:
+            ns20[k] = s20[k]
+        else:
+            _, r20 = stores["20s"].get_row(i20n)
+            ns20[k, :-1] = s20[k, 1:]
+            ns20[k, -1] = r20
+
+        if i5n == i5:
+            ns5m[k] = s5m[k]
+        else:
+            _, r5 = stores["5m"].get_row(i5n)
+            ns5m[k, :-1] = s5m[k, 1:]
+            ns5m[k, -1] = r5
+
+        if i1n == i1:
+            ns1h[k] = s1h[k]
+        else:
+            _, r1 = stores["1h"].get_row(i1n)
+            ns1h[k, :-1] = s1h[k, 1:]
+            ns1h[k, -1] = r1
+
+    return s250, s20, s5m, s1h, ns250, ns20, ns5m, ns1h
+
+
+@torch.no_grad()
+def evaluate_policy(actor: nn.Module, stores, norm, start_lo: int, start_hi: int, total_steps: int, device: str):
+    actor.eval()
+    env = TradingEnv(stores, norm, close_idx_in_x250=8, device=device, torch_obs=True)
+
+    steps = 0
+    ep = 0
+    sum_r = 0.0
+    sum_bal = 0.0
+
+    while steps < total_steps:
+        start_i = random.randint(start_lo, start_hi)
+        obs = env.reset(start_i)
+
+        done = False
+        while (not done) and (steps < total_steps):
+            a = select_action(actor, obs, device=device, deterministic=True)
+            obs, r, done, info = env.step(a)
+            sum_r += float(r)
+            steps += 1
+
+        sum_bal += float(env.balance)
+        ep += 1
+
+    actor.train()
+    avg_r_step = sum_r / max(1, steps)
+    avg_bal = sum_bal / max(1, ep)
+    return {"steps": int(steps), "episodes": int(ep), "avg_reward_per_step": float(avg_r_step), "avg_final_balance": float(avg_bal)}
+
 
 
 def train():
     seed_all(SEED)
+
+    if DEVICE == "cuda":
+        if USE_TF32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark = True
 
     with (OUT_ROOT / "dataset_meta.json").open("r") as f:
         ds_meta = json.load(f)
 
     norm = ds_meta["norm"]
     train_end_ms = int(ds_meta["train_end_ms"])
+    val_end_ms = int(ds_meta["val_end_ms"])
 
     stores = {
         "250ms": ScaleStore(OUT_ROOT / "250ms"),
@@ -70,12 +173,17 @@ def train():
     close_idx = 8
     ctx_dim = 2 + N_ACTIONS + (VOTE_N * N_ACTIONS)
 
-    rb = ReplayBuffer(REPLAY_CAP, ctx_dim)
+    rb = ReplayBuffer(REPLAY_CAP, ctx_dim, REPLAY_DIR)
 
     actor = ActorNet(stores["250ms"].d, stores["20s"].d, stores["5m"].d, stores["1h"].d, ctx_dim).to(DEVICE)
     critic = CriticNet(stores["250ms"].d, stores["20s"].d, stores["5m"].d, stores["1h"].d, ctx_dim).to(DEVICE)
     critic_tgt = CriticNet(stores["250ms"].d, stores["20s"].d, stores["5m"].d, stores["1h"].d, ctx_dim).to(DEVICE)
     critic_tgt.load_state_dict(critic.state_dict())
+
+    if USE_COMPILE and hasattr(torch, "compile"):
+        actor = torch.compile(actor)
+        critic = torch.compile(critic)
+        critic_tgt = torch.compile(critic_tgt)
 
     print(f"actor params:", f"{count_params(actor):,}")
     print(f"critic params:", f"{count_params(critic):,}")
@@ -86,13 +194,15 @@ def train():
     log_alpha = torch.tensor(math.log(ALPHA_INIT), device=DEVICE, requires_grad=True)
     opt_alpha = torch.optim.Adam([log_alpha], lr=LR_ALPHA)
 
-    mean = {k: torch.tensor(norm[k]["mean"], device=DEVICE, dtype=DTYPE) for k in norm}
-    std = {k: torch.tensor(norm[k]["std"], device=DEVICE, dtype=DTYPE) for k in norm}
+    mean = {k: torch.tensor(norm[k]["mean"], device=DEVICE, dtype=torch.float32) for k in norm}
+    std = {k: torch.tensor(norm[k]["std"], device=DEVICE, dtype=torch.float32) for k in norm}
 
     def norm_t(scale, x):
         return (x - mean[scale]) / std[scale]
 
-    base_train_end = find_first_idx_ge(stores["250ms"], train_end_ms)
+    base_store = stores["250ms"]
+    base_train_end = first_idx_ge_regular(base_store.first_ts, base_store.interval_ms, base_store.total_rows, train_end_ms)
+    base_val_end = first_idx_ge_regular(base_store.first_ts, base_store.interval_ms, base_store.total_rows, val_end_ms)
 
     req_t = max(
         stores["250ms"].first_ts + (SEQ_LEN - 1) * stores["250ms"].interval_ms,
@@ -100,24 +210,19 @@ def train():
         stores["5m"].first_ts + (SEQ_LEN - 1) * stores["5m"].interval_ms,
         stores["1h"].first_ts + (SEQ_LEN - 1) * stores["1h"].interval_ms,
     )
-    warmup_min_i = find_first_idx_ge(stores["250ms"], req_t)
+    warmup_min_i = first_idx_ge_regular(base_store.first_ts, base_store.interval_ms, base_store.total_rows, req_t)
 
-    env = TradingEnv(stores, norm, close_idx_in_x250=close_idx)
+    env = TradingEnv(stores, norm, close_idx_in_x250=close_idx, device=DEVICE, torch_obs=True)
     episode_steps = env.episode_steps
 
-    def sample_start():
-        hi = max(warmup_min_i + 1, base_train_end - episode_steps - 2)
+    def sample_start(lo: int, hi: int):
         while True:
-            i = random.randint(warmup_min_i, hi)
-            t_ms, _ = stores["250ms"].get_row(i)
+            i = random.randint(lo, hi)
+            t_ms = base_store.ts_of_idx(i)
             i20 = map_base_ts_to_scale_idx(stores["20s"], t_ms)
             i5m = map_base_ts_to_scale_idx(stores["5m"], t_ms)
             i1h = map_base_ts_to_scale_idx(stores["1h"], t_ms)
-            if i < (SEQ_LEN - 1):
-                continue
             if i20 < (SEQ_LEN - 1) or i5m < (SEQ_LEN - 1) or i1h < (SEQ_LEN - 1):
-                continue
-            if i + episode_steps + 2 >= base_train_end:
                 continue
             return i
 
@@ -127,23 +232,23 @@ def train():
                 p_t.data.mul_(1.0 - tau).add_(p.data, alpha=tau)
 
     def update_step():
-        i, a, r, d, ni, ctx, nctx = rb.sample(BATCH_SIZE)
+        i, a, r, d, ctx, nctx = rb.sample(BATCH_SIZE)
+        i = i.astype(np.int64, copy=False)
 
-        s250, s20, s5m, s1h = load_batch_seqs(stores, i, SEQ_LEN)
-        ns250, ns20, ns5m, ns1h = load_batch_seqs(stores, ni, SEQ_LEN)
+        s250, s20, s5m, s1h, ns250, ns20, ns5m, ns1h = load_batch_s_and_ns(stores, i, SEQ_LEN)
 
-        s250 = torch.tensor(s250, device=DEVICE, dtype=DTYPE)
-        s20 = torch.tensor(s20, device=DEVICE, dtype=DTYPE)
-        s5m = torch.tensor(s5m, device=DEVICE, dtype=DTYPE)
-        s1h = torch.tensor(s1h, device=DEVICE, dtype=DTYPE)
+        s250 = torch.from_numpy(s250).to(DEVICE, dtype=torch.float32)
+        s20 = torch.from_numpy(s20).to(DEVICE, dtype=torch.float32)
+        s5m = torch.from_numpy(s5m).to(DEVICE, dtype=torch.float32)
+        s1h = torch.from_numpy(s1h).to(DEVICE, dtype=torch.float32)
 
-        ns250 = torch.tensor(ns250, device=DEVICE, dtype=DTYPE)
-        ns20 = torch.tensor(ns20, device=DEVICE, dtype=DTYPE)
-        ns5m = torch.tensor(ns5m, device=DEVICE, dtype=DTYPE)
-        ns1h = torch.tensor(ns1h, device=DEVICE, dtype=DTYPE)
+        ns250 = torch.from_numpy(ns250).to(DEVICE, dtype=torch.float32)
+        ns20 = torch.from_numpy(ns20).to(DEVICE, dtype=torch.float32)
+        ns5m = torch.from_numpy(ns5m).to(DEVICE, dtype=torch.float32)
+        ns1h = torch.from_numpy(ns1h).to(DEVICE, dtype=torch.float32)
 
-        ctx = torch.tensor(ctx, device=DEVICE, dtype=DTYPE)
-        nctx = torch.tensor(nctx, device=DEVICE, dtype=DTYPE)
+        ctx = torch.from_numpy(ctx).to(DEVICE, dtype=torch.float32)
+        nctx = torch.from_numpy(nctx).to(DEVICE, dtype=torch.float32)
 
         s250 = norm_t("250ms", s250)
         s20 = norm_t("20s", s20)
@@ -155,53 +260,66 @@ def train():
         ns5m = norm_t("5m", ns5m)
         ns1h = norm_t("1h", ns1h)
 
-        a = torch.tensor(a, device=DEVICE, dtype=torch.long)
-        r = torch.tensor(r, device=DEVICE, dtype=DTYPE)
-        d = torch.tensor(d, device=DEVICE, dtype=DTYPE)
+        a = torch.from_numpy(a).to(DEVICE, dtype=torch.long)
+        r = torch.from_numpy(r).to(DEVICE, dtype=torch.float32)
+        d = torch.from_numpy(d).to(DEVICE, dtype=torch.float32)
 
         alpha_det = log_alpha.exp().detach()
 
-        with torch.no_grad():
-            logits_n = actor(ns250, ns20, ns5m, ns1h, nctx)
-            logp_n = F.log_softmax(logits_n, dim=-1)
-            p_n = torch.exp(logp_n)
+        amp_on = (DEVICE == "cuda") and USE_AMP_BF16
+        amp_dtype = torch.bfloat16
 
-            tq1, tq2 = critic_tgt(ns250, ns20, ns5m, ns1h, nctx)
-            tq = torch.min(tq1, tq2)
-            v = (p_n * (tq - alpha_det * logp_n)).sum(dim=-1)
-            y = r + (1.0 - d) * float(GAMMA) * v
+        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_on):
+            with torch.no_grad():
+                logits_n = actor(ns250, ns20, ns5m, ns1h, nctx)
+                logp_n = F.log_softmax(logits_n, dim=-1)
+                p_n = torch.exp(logp_n)
 
-        q1, q2 = critic(s250, s20, s5m, s1h, ctx)
-        q1_a = q1.gather(1, a.view(-1, 1)).squeeze(1)
-        q2_a = q2.gather(1, a.view(-1, 1)).squeeze(1)
-        critic_loss = F.mse_loss(q1_a, y) + F.mse_loss(q2_a, y)
+                tq1, tq2 = critic_tgt(ns250, ns20, ns5m, ns1h, nctx)
+                tq = torch.min(tq1, tq2)
+                tq = tq.float()
+                logp_n_f = logp_n.float()
+                p_n_f = p_n.float()
 
-        opt_critic.zero_grad()
+                v = (p_n_f * (tq - alpha_det * logp_n_f)).sum(dim=-1)
+                y = r + (1.0 - d) * float(GAMMA) * v
+
+            q1, q2 = critic(s250, s20, s5m, s1h, ctx)
+            q1 = q1.float()
+            q2 = q2.float()
+            q1_a = q1.gather(1, a.view(-1, 1)).squeeze(1)
+            q2_a = q2.gather(1, a.view(-1, 1)).squeeze(1)
+            critic_loss = F.mse_loss(q1_a, y) + F.mse_loss(q2_a, y)
+
+        opt_critic.zero_grad(set_to_none=True)
         critic_loss.backward()
         nn.utils.clip_grad_norm_(critic.parameters(), 5.0)
         opt_critic.step()
 
-        logits = actor(s250, s20, s5m, s1h, ctx)
-        logp = F.log_softmax(logits, dim=-1)
-        p = torch.exp(logp)
+        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_on):
+            logits = actor(s250, s20, s5m, s1h, ctx)
+            logp = F.log_softmax(logits, dim=-1)
+            p = torch.exp(logp)
 
-        with torch.no_grad():
-            q1p, q2p = critic(s250, s20, s5m, s1h, ctx)
-            qmin = torch.min(q1p, q2p)
+            with torch.no_grad():
+                q1p, q2p = critic(s250, s20, s5m, s1h, ctx)
+                qmin = torch.min(q1p, q2p).float()
 
-        actor_loss = (p * (alpha_det * logp - qmin)).sum(dim=-1).mean()
+            logp_f = logp.float()
+            p_f = p.float()
+            actor_loss = (p_f * (alpha_det * logp_f - qmin)).sum(dim=-1).mean()
 
-        opt_actor.zero_grad()
+        opt_actor.zero_grad(set_to_none=True)
         actor_loss.backward()
         nn.utils.clip_grad_norm_(actor.parameters(), 5.0)
         opt_actor.step()
 
-        ent = -(p * logp).sum(dim=-1).mean()
+        ent = -(p.float() * logp.float()).sum(dim=-1).mean()
 
         alpha = log_alpha.exp()
         alpha_loss = alpha * (ent.detach() - float(TARGET_ENTROPY))
 
-        opt_alpha.zero_grad()
+        opt_alpha.zero_grad(set_to_none=True)
         alpha_loss.backward()
         opt_alpha.step()
 
@@ -209,12 +327,63 @@ def train():
 
         return float(critic_loss.item()), float(actor_loss.item()), float(ent.item()), float(log_alpha.exp().item())
 
+    def make_ckpt_state(ep: int, global_step: int):
+        rng = {
+            "py": random.getstate(),
+            "np": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+        state = {
+            "ep": int(ep),
+            "global_step": int(global_step),
+            "actor": actor.state_dict(),
+            "critic": critic.state_dict(),
+            "critic_tgt": critic_tgt.state_dict(),
+            "opt_actor": opt_actor.state_dict(),
+            "opt_critic": opt_critic.state_dict(),
+            "opt_alpha": opt_alpha.state_dict(),
+            "log_alpha": log_alpha.detach().cpu(),
+            "rb": {"ptr": int(rb.ptr), "size": int(rb.size), "cap": int(rb.cap), "ctx_dim": int(rb.ctx_dim), "replay_dir": str(rb.replay_dir.as_posix())},
+            "rng": rng,
+        }
+        return state
+
     global_step = 0
-    for ep in range(MAX_EPISODES):
-        start_i = sample_start()
+    start_ep = 0
+
+    if RESUME_PATH:
+        ckpt = load_checkpoint(Path(RESUME_PATH), DEVICE)
+        actor.load_state_dict(ckpt["actor"])
+        critic.load_state_dict(ckpt["critic"])
+        critic_tgt.load_state_dict(ckpt["critic_tgt"])
+        opt_actor.load_state_dict(ckpt["opt_actor"])
+        opt_critic.load_state_dict(ckpt["opt_critic"])
+        opt_alpha.load_state_dict(ckpt["opt_alpha"])
+        log_alpha.data.copy_(ckpt["log_alpha"].to(DEVICE))
+
+        rb.set_state(ckpt["rb"]["ptr"], ckpt["rb"]["size"])
+
+        random.setstate(ckpt["rng"]["py"])
+        np.random.set_state(ckpt["rng"]["np"])
+        torch.set_rng_state(ckpt["rng"]["torch"])
+        if torch.cuda.is_available() and ckpt["rng"]["cuda"] is not None:
+            torch.cuda.set_rng_state_all(ckpt["rng"]["cuda"])
+
+        global_step = int(ckpt["global_step"])
+        start_ep = int(ckpt["ep"]) + 1
+        print("resumed:", RESUME_PATH, "ep", start_ep, "global_step", global_step)
+
+    train_hi = max(warmup_min_i + 1, base_train_end - episode_steps - 2)
+    val_lo = base_train_end
+    val_hi = max(val_lo + 1, base_val_end - episode_steps - 2)
+
+    for ep in range(start_ep, MAX_EPISODES):
+        start_i = sample_start(warmup_min_i, train_hi)
         obs = env.reset(start_i)
 
-        pbar = tqdm(total=env.episode_steps, desc=f"ep {ep}", dynamic_ncols=True)
+        pbar = tqdm(total=env.episode_steps, desc=f"ep {ep}", dynamic_ncols=True, mininterval=0.2)
+
         ep_reward = 0.0
         ep_c = 0.0
         ep_a = 0.0
@@ -222,11 +391,14 @@ def train():
         ep_alpha = 0.0
         ep_updates = 0
 
+        chunk = 0
+        steps_in_ep = 0
+
         while True:
             if global_step < WARMUP_STEPS:
                 a_prop = random.randrange(N_ACTIONS)
             else:
-                a_prop = select_action(actor, obs, DEVICE)
+                a_prop = select_action(actor, obs, DEVICE, deterministic=False)
 
             ctx = obs["ctx"].copy()
             cur_i = env.i
@@ -234,12 +406,12 @@ def train():
             next_obs, rwd, done, info = env.step(a_prop)
 
             nctx = next_obs["ctx"].copy()
-            next_i = env.i
 
-            rb.add(cur_i, int(a_prop), float(rwd), float(done), next_i, ctx, nctx)
+            rb.add(cur_i, int(a_prop), float(rwd), float(done), ctx, nctx)
 
             ep_reward += float(rwd)
             global_step += 1
+            steps_in_ep += 1
 
             if rb.size >= BATCH_SIZE and global_step >= WARMUP_STEPS and (global_step % UPDATE_EVERY) == 0:
                 for _ in range(UPDATES_PER_STEP):
@@ -250,20 +422,30 @@ def train():
                     ep_alpha += alp
                     ep_updates += 1
 
-            pbar.set_postfix({
-                "bal": f"{info['balance']:6.2f}",
-                # "pos": info["pos"],
-                "r": f"{ep_reward:10.6f}",
-                # "exec": ACTIONS[int(info["exec_action"])],
-                "rb": f"{rb.size:08d}",
-            })
-            pbar.update(1)
+            chunk += 1
+            if chunk >= PBAR_EVERY:
+                pbar.update(chunk)
+                chunk = 0
+                pbar.set_postfix({
+                    "bal": f"{info['balance']:6.2f}",
+                    "R": f"{ep_reward:10.6f}",
+                    "rb": f"{rb.size:08d}",
+                })
 
             obs = next_obs
             if done:
                 break
 
+        if chunk > 0:
+            pbar.update(chunk)
+            pbar.set_postfix({
+                "bal": f"{info['balance']:6.2f}",
+                "R": f"{ep_reward:10.6f}",
+                "rb": f"{rb.size:08d}",
+            })
+
         pbar.close()
+
         if ep_updates > 0:
             ep_c /= ep_updates
             ep_a /= ep_updates
@@ -271,6 +453,16 @@ def train():
             ep_alpha /= ep_updates
 
         print(
-            f"episode {ep} reward={ep_reward:.4f} bal={env.balance:.2f} "
+            f"episode {ep} steps={steps_in_ep} reward={ep_reward:.4f} bal={env.balance:.2f} "
             f"critic={ep_c:.4f} actor={ep_a:.4f} ent={ep_ent:.4f} alpha={ep_alpha:.4f}"
         )
+
+        if (CKPT_EVERY_EP > 0) and ((ep + 1) % CKPT_EVERY_EP == 0):
+            rb.flush()
+            ckpt_path = CHECKPOINT_DIR / f"ckpt_ep{ep:06d}.pt"
+            save_checkpoint(ckpt_path, make_ckpt_state(ep, global_step))
+            print("saved ckpt:", ckpt_path.as_posix())
+
+        if (EVAL_EVERY_EP > 0) and ((ep + 1) % EVAL_EVERY_EP == 0):
+            ev = evaluate_policy(actor, stores, norm, val_lo, val_hi, EVAL_TOTAL_STEPS, DEVICE)
+            print("eval:", ev)

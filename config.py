@@ -6,6 +6,7 @@ import math
 # =========================
 # PARAMS
 # =========================
+
 MODE = "train"  # "prepare" or "train"
 
 SYMBOL = "BTCUSDT"
@@ -13,6 +14,9 @@ DATA_ROOT = Path("data")
 TRADES_DIR = DATA_ROOT / "trades"
 BOOK_DIR = DATA_ROOT / "bookDepth"
 OUT_ROOT = Path("processed") / SYMBOL
+CHECKPOINT_DIR = OUT_ROOT / "checkpoints"
+REPLAY_DIR = OUT_ROOT / "replay_memmap"
+RESUME_PATH = ""  # "" or path to a .pt
 
 BASE_MS = 250
 SCALES_MS = {
@@ -43,7 +47,7 @@ FEE_OPEN = 0.0004
 FEE_CLOSE = 0.0004
 LOSS_THRESHOLD_FRAC = 0.666
 EPISODE_HOURS = 6
-VOTE_N = 20
+VOTE_N = 40
 
 ACTIONS = ["HOLD", "OPEN_LONG", "OPEN_SHORT", "CLOSE"]
 N_ACTIONS = len(ACTIONS)
@@ -52,17 +56,27 @@ N_ACTIONS = len(ACTIONS)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float32
 
+NUM_WORKERS = 6
+PREFETCH_FACTOR = 4
+PIN_MEMORY = True
+PERSISTENT_WORKERS = True
+
 GAMMA = 0.997
 TAU = 0.01
 LR_ACTOR = 3e-4
 LR_CRITIC = 3e-4
 LR_ALPHA = 3e-4
-BATCH_SIZE = 1024
+BATCH_SIZE = 128
 REPLAY_CAP = 800_000
 WARMUP_STEPS = 50_000
 UPDATES_PER_STEP = 1
 UPDATE_EVERY = 1
 MAX_EPISODES = 10_000
+CKPT_EVERY_EP = 50
+EVAL_EVERY_EP = 50
+EVAL_TOTAL_STEPS = 200_000
+
+PBAR_EVERY = 2
 
 ALPHA_INIT = 0.2
 TARGET_ENTROPY = math.log(N_ACTIONS) * 0.9
@@ -71,3 +85,7 @@ TARGET_ENTROPY = math.log(N_ACTIONS) * 0.9
 HIDDEN = 192
 ENC_HIDDEN = 256
 DROPOUT = 0.1
+
+USE_TF32 = True
+USE_AMP_BF16 = True
+USE_COMPILE = False

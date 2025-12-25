@@ -97,4 +97,3 @@ class CriticNet(nn.Module):
     def forward(self, s250, s20, s5m, s1h, ctx):
         z = self.enc(s250, s20, s5m, s1h, ctx)
         return self.q1(z), self.q2(z)
-
