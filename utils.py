@@ -47,9 +47,8 @@ def save_checkpoint(path: Path, state: dict):
 
 
 def load_checkpoint(path: Path, device: str):
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, weights_only=False, map_location=device)
     return ckpt
-
 
 # =========================
 # TIME UTILS
@@ -125,3 +124,10 @@ def read_last_data_row_csv(path: Path, max_bytes: int = 4_000_000):
             continue
         return s.split(",")
     return None
+
+def latest_checkpoint_path(ckpt_dir: Path):
+    ckpt_dir = Path(ckpt_dir)
+    ckpts = sorted(ckpt_dir.glob("ckpt_ep*.pt"))
+    if not ckpts:
+        return None
+    return ckpts[-1]

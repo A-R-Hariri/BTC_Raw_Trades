@@ -1,6 +1,9 @@
 import json
 import time
+import random
+import math
 import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,9 +21,28 @@ if NOTEBOOK:
 else:
     from tqdm import tqdm
 
+def build_signature(stores: dict, ctx_dim: int) -> dict:
+    return {
+        "symbol": str(SYMBOL),
+        "base_ms": int(BASE_MS),
+        "scales_ms": {k: int(v) for k, v in SCALES_MS.items()},
+        "seq_len": int(SEQ_LEN),
+        "ctx_dim": int(ctx_dim),
+        "n_actions": int(N_ACTIONS),
+        "vote_n": int(VOTE_N),
+        "dtype": str(DTYPE),
+        "model": {
+            "hidden": int(HIDDEN),
+            "enc_hidden": int(ENC_HIDDEN),
+            "dropout": float(DROPOUT),
+        },
+        "replay": {"cap": int(REPLAY_CAP)},
+        "store_dims": {k: int(stores[k].d) for k in stores.keys()},
+    }
+
 
 # =========================
-# TRAIN
+# ACT / EVAL
 # =========================
 @torch.no_grad()
 def select_action(actor: ActorNet, obs, device: str, deterministic: bool = False):
@@ -44,6 +66,44 @@ def select_action(actor: ActorNet, obs, device: str, deterministic: bool = False
     return int(dist.sample().item())
 
 
+@torch.no_grad()
+def evaluate_policy(actor: nn.Module, stores, norm, start_lo: int, start_hi: int, total_steps: int, device: str):
+    actor.eval()
+    env = TradingEnv(stores, norm, close_idx_in_x250=8, device=device, torch_obs=True)
+
+    steps = 0
+    ep = 0
+    sum_r = 0.0
+    sum_bal = 0.0
+
+    while steps < total_steps:
+        start_i = random.randint(start_lo, start_hi)
+        obs = env.reset(start_i)
+        done = False
+
+        while (not done) and (steps < total_steps):
+            a = select_action(actor, obs, device=device, deterministic=True)
+            obs, r, done, info = env.step(a)
+            sum_r += float(r)
+            steps += 1
+
+        sum_bal += float(env.balance)
+        ep += 1
+
+    actor.train()
+    avg_r_step = sum_r / max(1, steps)
+    avg_bal = sum_bal / max(1, ep)
+    return {
+        "steps": int(steps),
+        "episodes": int(ep),
+        "avg_reward_per_step": float(avg_r_step),
+        "avg_final_balance": float(avg_bal),
+    }
+
+
+# =========================
+# BATCH BUILDING (NO DATALOADER, NO MP)
+# =========================
 def load_batch_s_and_ns(stores, i_arr, seq_len):
     i_arr = np.asarray(i_arr, dtype=np.int64)
     b = len(i_arr)
@@ -100,83 +160,28 @@ def load_batch_s_and_ns(stores, i_arr, seq_len):
 
     return s250, s20, s5m, s1h, ns250, ns20, ns5m, ns1h
 
-
-@torch.no_grad()
-def evaluate_policy(actor: nn.Module, stores, norm, start_lo: int, start_hi: int, total_steps: int, device: str):
-    actor.eval()
-    env = TradingEnv(stores, norm, close_idx_in_x250=8, device=device, torch_obs=True)
-
-    steps = 0
-    ep = 0
-    sum_r = 0.0
-    sum_bal = 0.0
-
-    while steps < total_steps:
-        start_i = random.randint(start_lo, start_hi)
-        obs = env.reset(start_i)
-
-        done = False
-        while (not done) and (steps < total_steps):
-            a = select_action(actor, obs, device=device, deterministic=True)
-            obs, r, done, info = env.step(a)
-            sum_r += float(r)
-            steps += 1
-
-        sum_bal += float(env.balance)
-        ep += 1
-
-    actor.train()
-    avg_r_step = sum_r / max(1, steps)
-    avg_bal = sum_bal / max(1, ep)
-    return {"steps": int(steps), "episodes": int(ep), "avg_reward_per_step": float(avg_r_step), "avg_final_balance": float(avg_bal)}
-
-
 class ReplayBatchIterable(IterableDataset):
-    def __init__(self, out_root: Path, replay_dir: Path, ctx_dim: int, batch_size: int, seq_len: int, rb_size_value):
+    def __init__(self, out_root, rb: ReplayBuffer, rb_size_value, ctx_dim: int, batch_size: int, seq_len: int):
         super().__init__()
-        self.out_root = Path(out_root)
-        self.replay_dir = Path(replay_dir)
+        self.out_root = out_root
+        self.rb = rb
+        self.rb_size_value = rb_size_value
         self.ctx_dim = int(ctx_dim)
         self.batch_size = int(batch_size)
         self.seq_len = int(seq_len)
-        self.rb_size_value = rb_size_value
 
         self._inited = False
         self.stores = None
-        self.cap = None
-
-        self.i = None
-        self.a = None
-        self.r = None
-        self.d = None
-        self.ctx = None
-        self.nctx = None
 
     def _init_once(self):
         if self._inited:
             return
-
-        with (self.replay_dir / "replay_meta.json").open("r") as f:
-            meta = json.load(f)
-        self.cap = int(meta["cap"])
-
-        def mm(path: Path, dtype, shape):
-            return np.memmap(str(path), dtype=dtype, mode="r", shape=shape)
-
-        self.i = mm(self.replay_dir / "i.dat", np.int64, (self.cap,))
-        self.a = mm(self.replay_dir / "a.dat", np.int64, (self.cap,))
-        self.r = mm(self.replay_dir / "r.dat", np.float32, (self.cap,))
-        self.d = mm(self.replay_dir / "d.dat", np.float32, (self.cap,))
-        self.ctx = mm(self.replay_dir / "ctx.dat", np.float32, (self.cap, self.ctx_dim))
-        self.nctx = mm(self.replay_dir / "nctx.dat", np.float32, (self.cap, self.ctx_dim))
-
         self.stores = {
             "250ms": ScaleStore(self.out_root / "250ms"),
-            "20s": ScaleStore(self.out_root / "20s"),
-            "5m": ScaleStore(self.out_root / "5m"),
-            "1h": ScaleStore(self.out_root / "1h"),
+            "20s":  ScaleStore(self.out_root / "20s"),
+            "5m":   ScaleStore(self.out_root / "5m"),
+            "1h":   ScaleStore(self.out_root / "1h"),
         }
-
         self._inited = True
 
     def __iter__(self):
@@ -188,17 +193,18 @@ class ReplayBatchIterable(IterableDataset):
         while True:
             size = int(self.rb_size_value.value)
             if size < self.batch_size:
-                time.sleep(0.01)
+                time.sleep(0.001)
                 continue
 
-            ridx = rng.integers(0, size, size=self.batch_size, dtype=np.int64)
+            hi = size if size < self.rb.cap else self.rb.cap
+            ridx = rng.integers(0, hi, size=self.batch_size, dtype=np.int64)
 
-            i_end = self.i[ridx].astype(np.int64, copy=False)
-            a = self.a[ridx].astype(np.int64, copy=False)
-            r = self.r[ridx].astype(np.float32, copy=False)
-            d = self.d[ridx].astype(np.float32, copy=False)
-            ctx = self.ctx[ridx].astype(np.float32, copy=False)
-            nctx = self.nctx[ridx].astype(np.float32, copy=False)
+            i_end = self.rb.i[ridx].numpy().astype(np.int64, copy=False)
+            a     = self.rb.a[ridx].numpy().astype(np.int64, copy=False)
+            r     = self.rb.r[ridx].numpy().astype(np.float32, copy=False)
+            d     = self.rb.d[ridx].numpy().astype(np.float32, copy=False)
+            ctx   = self.rb.ctx[ridx].numpy().astype(np.float32, copy=False)
+            nctx  = self.rb.nctx[ridx].numpy().astype(np.float32, copy=False)
 
             s250, s20, s5m, s1h, ns250, ns20, ns5m, ns1h = load_batch_s_and_ns(self.stores, i_end, self.seq_len)
 
@@ -218,7 +224,9 @@ class ReplayBatchIterable(IterableDataset):
                 torch.from_numpy(nctx),
             )
 
-
+# =========================
+# TRAIN
+# =========================
 def train():
     seed_all(SEED)
 
@@ -244,24 +252,21 @@ def train():
     }
 
     close_idx = 8
-    ctx_dim = 2 + N_ACTIONS + (VOTE_N * N_ACTIONS)
+    ctx_dim = CTX_DIM
 
-    rb = ReplayBuffer(REPLAY_CAP, ctx_dim, REPLAY_DIR)
+    rb = ReplayBuffer(REPLAY_CAP, ctx_dim, share_memory=(NUM_WORKERS > 0))
     rb_size_value = mp.Value("i", 0)
     rb_size_value.value = int(rb.size)
 
-    def make_loader():
-        ds = ReplayBatchIterable(OUT_ROOT, REPLAY_DIR, ctx_dim, BATCH_SIZE, SEQ_LEN, rb_size_value)
-        return DataLoader(
-            ds,
-            batch_size=None,
-            num_workers=NUM_WORKERS,
-            pin_memory=PIN_MEMORY,
-            prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
-            persistent_workers=PERSISTENT_WORKERS if NUM_WORKERS > 0 else False,
-        )
-
-    batch_loader = make_loader()
+    ds = ReplayBatchIterable(OUT_ROOT, rb, rb_size_value, ctx_dim, BATCH_SIZE, SEQ_LEN)
+    batch_loader = DataLoader(
+        ds,
+        batch_size=None,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
+        prefetch_factor=(PREFETCH_FACTOR if NUM_WORKERS > 0 else None),
+        persistent_workers=(PERSISTENT_WORKERS if NUM_WORKERS > 0 else False),
+    )
     batch_iter = iter(batch_loader)
 
     actor = ActorNet(stores["250ms"].d, stores["20s"].d, stores["5m"].d, stores["1h"].d, ctx_dim).to(DEVICE)
@@ -274,8 +279,8 @@ def train():
         critic = torch.compile(critic)
         critic_tgt = torch.compile(critic_tgt)
 
-    print(f"actor params:", f"{count_params(actor):,}")
-    print(f"critic params:", f"{count_params(critic):,}")
+    print("actor params:", f"{count_params(actor):,}")
+    print("critic params:", f"{count_params(critic):,}")
 
     opt_actor = torch.optim.Adam(actor.parameters(), lr=LR_ACTOR)
     opt_critic = torch.optim.Adam(critic.parameters(), lr=LR_CRITIC)
@@ -334,10 +339,10 @@ def train():
         ns5m  = ns5m.to(DEVICE, dtype=torch.float32, non_blocking=True)
         ns1h  = ns1h.to(DEVICE, dtype=torch.float32, non_blocking=True)
 
-        a   = a.to(DEVICE, dtype=torch.long, non_blocking=True)
-        r   = r.to(DEVICE, dtype=torch.float32, non_blocking=True)
-        d   = d.to(DEVICE, dtype=torch.float32, non_blocking=True)
-        ctx = ctx.to(DEVICE, dtype=torch.float32, non_blocking=True)
+        a    = a.to(DEVICE, dtype=torch.long, non_blocking=True)
+        r    = r.to(DEVICE, dtype=torch.float32, non_blocking=True)
+        d    = d.to(DEVICE, dtype=torch.float32, non_blocking=True)
+        ctx  = ctx.to(DEVICE, dtype=torch.float32, non_blocking=True)
         nctx = nctx.to(DEVICE, dtype=torch.float32, non_blocking=True)
 
         s250 = norm_t("250ms", s250)
@@ -414,7 +419,8 @@ def train():
             "torch": torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }
-        state = {
+        return {
+            "signature": build_signature(stores, ctx_dim),
             "ep": int(ep),
             "global_step": int(global_step),
             "actor": actor.state_dict(),
@@ -423,36 +429,49 @@ def train():
             "opt_actor": opt_actor.state_dict(),
             "opt_critic": opt_critic.state_dict(),
             "opt_alpha": opt_alpha.state_dict(),
-            "log_alpha": log_alpha.detach().cpu(),
-            "rb": {"ptr": int(rb.ptr), "size": int(rb.size), "cap": int(rb.cap), "ctx_dim": int(rb.ctx_dim), "replay_dir": str(rb.replay_dir.as_posix())},
+            "log_alpha": float(log_alpha.detach().cpu().item()),
+            "replay": rb.state_dict(),
             "rng": rng,
         }
-        return state
 
     global_step = 0
     start_ep = 0
 
-    if RESUME_PATH:
-        ckpt = load_checkpoint(Path(RESUME_PATH), DEVICE)
-        actor.load_state_dict(ckpt["actor"])
-        critic.load_state_dict(ckpt["critic"])
-        critic_tgt.load_state_dict(ckpt["critic_tgt"])
+    if RESUME:
+        ckpt_path = latest_checkpoint_path(CHECKPOINT_DIR)
+        if ckpt_path is None:
+            raise RuntimeError("RESUME=True but no checkpoint found in CHECKPOINT_DIR")
+
+        ckpt = load_checkpoint(Path(ckpt_path), "cpu")
+
+        sig_now = build_signature(stores, ctx_dim)
+        sig_old = ckpt.get("signature", None)
+        if sig_old is None:
+            raise RuntimeError("Checkpoint missing signature")
+        if sig_old != sig_now:
+            raise RuntimeError(f"Checkpoint/config mismatch\nckpt: {sig_old}\nnow:  {sig_now}")
+
+        actor.load_state_dict(ckpt["actor"], strict=True)
+        critic.load_state_dict(ckpt["critic"], strict=True)
+        critic_tgt.load_state_dict(ckpt["critic_tgt"], strict=True)
         opt_actor.load_state_dict(ckpt["opt_actor"])
         opt_critic.load_state_dict(ckpt["opt_critic"])
         opt_alpha.load_state_dict(ckpt["opt_alpha"])
-        log_alpha.data.copy_(ckpt["log_alpha"].to(DEVICE))
+        log_alpha.data.fill_(float(ckpt["log_alpha"]))
 
-        rb.set_state(ckpt["rb"]["ptr"], ckpt["rb"]["size"])
+        rb.load_state_dict(ckpt["replay"])
 
-        random.setstate(ckpt["rng"]["py"])
-        np.random.set_state(ckpt["rng"]["np"])
-        torch.set_rng_state(ckpt["rng"]["torch"])
-        if torch.cuda.is_available() and ckpt["rng"]["cuda"] is not None:
-            torch.cuda.set_rng_state_all(ckpt["rng"]["cuda"])
+        rng = ckpt.get("rng", None)
+        if rng is not None:
+            random.setstate(rng["py"])
+            np.random.set_state(rng["np"])
+            torch.set_rng_state(rng["torch"])
+            if torch.cuda.is_available() and (rng.get("cuda", None) is not None):
+                torch.cuda.set_rng_state_all(rng["cuda"])
 
-        global_step = int(ckpt["global_step"])
-        start_ep = int(ckpt["ep"]) + 1
-        print("resumed:", RESUME_PATH, "ep", start_ep, "global_step", global_step)
+        global_step = int(ckpt.get("global_step", 0))
+        start_ep = int(ckpt.get("ep", 0)) + 1
+        print(f"[RESUME] Loaded {ckpt_path} (start_ep={start_ep}, global_step={global_step}, rb_size={rb.size})")
 
     train_hi = max(warmup_min_i + 1, base_train_end - episode_steps - 2)
     val_lo = base_train_end
@@ -493,10 +512,14 @@ def train():
             global_step += 1
             steps_in_ep += 1
 
-            if rb.size >= BATCH_SIZE and global_step >= WARMUP_STEPS and (global_step % UPDATE_EVERY) == 0:
+            if rb.size >= BATCH_SIZE and global_step >= WARMUP_STEPS and \
+                                        (global_step % UPDATE_EVERY) == 0:
                 rb_size_value.value = int(rb.size)
                 for _ in range(UPDATES_PER_STEP):
-                    cl, al, ent, alp = update_step()
+                    out = update_step()
+                    if out is None:
+                        break
+                    cl, al, ent, alp = out
                     ep_c += cl
                     ep_a += al
                     ep_ent += ent
@@ -538,12 +561,11 @@ def train():
             f"critic={ep_c:.4f} actor={ep_a:.4f} ent={ep_ent:.4f} alpha={ep_alpha:.4f}"
         )
 
-        if (CKPT_EVERY_EP > 0) and ((ep + 1) % CKPT_EVERY_EP == 0):
-            rb.flush()
+        if (CKPT_EVERY_EP > 0) and ((ep + 1) % CKPT_EVERY_EP == 0) and (global_step > WARMUP_STEPS):
             ckpt_path = CHECKPOINT_DIR / f"ckpt_ep{ep:06d}.pt"
             save_checkpoint(ckpt_path, make_ckpt_state(ep, global_step))
             print("saved ckpt:", ckpt_path.as_posix())
 
-        if (EVAL_EVERY_EP > 0) and ((ep + 1) % EVAL_EVERY_EP == 0):
+        if (EVAL_EVERY_EP > 0) and ((ep + 1) % EVAL_EVERY_EP == 0) and (global_step > WARMUP_STEPS):
             ev = evaluate_policy(actor, stores, norm, val_lo, val_hi, EVAL_TOTAL_STEPS, DEVICE)
             print("eval:", ev)

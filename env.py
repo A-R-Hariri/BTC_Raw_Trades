@@ -1,6 +1,6 @@
 import numpy as np
 from collections import deque
-import json
+import torch
 
 from config import *
 from dataset import *
@@ -72,7 +72,7 @@ class TradingEnv:
     def _fee_mult(self, fee_rate: float):
         m = 1.0 - float(fee_rate) * float(LEVERAGE)
         return max(0.0, m)
-
+    
     def _ctx_vec(self):
         last = np.zeros(N_ACTIONS, dtype=np.float32)
         last[self.last_exec] = 1.0
@@ -85,11 +85,24 @@ class TradingEnv:
         for i, a in enumerate(q):
             q_oh[i, int(a)] = 1.0
 
+        unrealized = 0.0
+        if self.pos != 0 and self.entry_price > 0:
+            _, row = self.stores["250ms"].get_row(self.i)
+            price_now = float(row[self.close_idx])
+            unrealized = self.pos * (price_now - self.entry_price) / max(self.entry_price, 1e-8)
+
+        realized = (self.balance - INIT_BALANCE) / INIT_BALANCE
         ctx = np.concatenate([
-            np.array([float(self.pos), float(self.balance / INIT_BALANCE)], dtype=np.float32),
+            np.array([
+                float(self.pos),
+                float(self.balance / INIT_BALANCE),
+                float(unrealized),
+                float(realized),
+            ], dtype=np.float32),
             last,
             q_oh.reshape(-1).astype(np.float32)
         ]).astype(np.float32)
+
         return ctx
 
     def _obs(self):
@@ -172,24 +185,29 @@ class TradingEnv:
             if self.pos == 0:
                 self.balance *= self._fee_mult(FEE_OPEN)
                 self.pos = 1
+                self.entry_price = price_now
             elif self.pos == -1:
                 self.balance *= self._fee_mult(FEE_CLOSE)
                 self.balance *= self._fee_mult(FEE_OPEN)
                 self.pos = 1
+                self.entry_price = price_now
 
         elif exec_a == 2:
             if self.pos == 0:
                 self.balance *= self._fee_mult(FEE_OPEN)
                 self.pos = -1
+                self.entry_price = price_now
             elif self.pos == 1:
                 self.balance *= self._fee_mult(FEE_CLOSE)
                 self.balance *= self._fee_mult(FEE_OPEN)
                 self.pos = -1
+                self.entry_price = price_now
 
         elif exec_a == 3:
             if self.pos != 0:
                 self.balance *= self._fee_mult(FEE_CLOSE)
                 self.pos = 0
+                self.entry_price = 0.0
 
         next_i = self.i + 1
         if next_i >= self.stores["250ms"].total_rows:
@@ -200,7 +218,10 @@ class TradingEnv:
             reward = float((self.balance - bal_start) / (bal_start + EPS))
             self.i = self.stores["250ms"].total_rows - 1
             self.done = True
-            info = {"balance": float(self.balance), "pos": int(self.pos), "exec_action": int(self.last_exec)}
+            info = {"balance": float(self.balance), "pos": int(self.pos), 
+                    "exec_action": int(self.last_exec)}
+            if self.pos == 0 and exec_a == 0:
+                reward -= 1e-3 * (self.step_i / self.episode_steps)
             return self._obs(), reward, True, info
 
         _, x_next_row = self.stores["250ms"].get_row(next_i)
@@ -272,7 +293,10 @@ class TradingEnv:
             reward += float(self.balance - bal_before)
 
         self.done = done
-        info = {"balance": float(self.balance), "pos": int(self.pos), "exec_action": int(self.last_exec)}
+        info = {"balance": float(self.balance), "pos": int(self.pos), 
+                "exec_action": int(self.last_exec)}
+        if self.pos == 0 and exec_a == 0:
+                reward -= 1e-3 * (self.step_i / self.episode_steps)
         return self._obs(), reward, done, info
     
     
@@ -280,66 +304,28 @@ class TradingEnv:
 # REPLAY
 # =========================
 class ReplayBuffer:
-    def __init__(self, cap: int, ctx_dim: int, replay_dir: Path):
+    def __init__(self, cap: int, ctx_dim: int, share_memory: bool = True):
         self.cap = int(cap)
         self.ctx_dim = int(ctx_dim)
-        self.replay_dir = Path(replay_dir)
-        self.replay_dir.mkdir(parents=True, exist_ok=True)
-        self.meta_path = self.replay_dir / "replay_meta.json"
-
-        def mm(path: Path, dtype, shape, mode):
-            return np.memmap(str(path), dtype=dtype, mode=mode, shape=shape)
-
-        def wipe_dir():
-            for name in ["i.dat", "a.dat", "r.dat", "d.dat", "ctx.dat", "nctx.dat", "replay_meta.json"]:
-                p = self.replay_dir / name
-                if p.exists():
-                    try:
-                        p.unlink()
-                    except Exception:
-                        pass
-
-        mode = "w+"
         self.ptr = 0
         self.size = 0
+        self.entry_price = 0.0
 
-        if self.meta_path.exists():
-            try:
-                with self.meta_path.open("r") as f:
-                    meta = json.load(f)
-                cap_ok = int(meta.get("cap", -1)) == self.cap
-                ctx_ok = int(meta.get("ctx_dim", -1)) == self.ctx_dim
-                if cap_ok and ctx_ok:
-                    self.ptr = int(meta.get("ptr", 0))
-                    self.size = int(meta.get("size", 0))
-                    mode = "r+"
-                else:
-                    wipe_dir()
-            except Exception:
-                wipe_dir()
+        # CPU tensors (optionally shared so DataLoader workers can read it on Windows)
+        self.i = torch.empty((self.cap,), dtype=torch.int64)
+        self.a = torch.empty((self.cap,), dtype=torch.int64)
+        self.r = torch.empty((self.cap,), dtype=torch.float32)
+        self.d = torch.empty((self.cap,), dtype=torch.float32)
+        self.ctx = torch.empty((self.cap, self.ctx_dim), dtype=torch.float32)
+        self.nctx = torch.empty((self.cap, self.ctx_dim), dtype=torch.float32)
 
-        self.i = mm(self.replay_dir / "i.dat", np.int64, (self.cap,), mode)
-        self.a = mm(self.replay_dir / "a.dat", np.int64, (self.cap,), mode)
-        self.r = mm(self.replay_dir / "r.dat", np.float32, (self.cap,), mode)
-        self.d = mm(self.replay_dir / "d.dat", np.float32, (self.cap,), mode)
-        self.ctx = mm(self.replay_dir / "ctx.dat", np.float32, (self.cap, self.ctx_dim), mode)
-        self.nctx = mm(self.replay_dir / "nctx.dat", np.float32, (self.cap, self.ctx_dim), mode)
-
-        self._save_meta()
-
-    def _save_meta(self):
-        meta = {"cap": int(self.cap), "ctx_dim": int(self.ctx_dim), "ptr": int(self.ptr), "size": int(self.size)}
-        with self.meta_path.open("w") as f:
-            json.dump(meta, f)
-
-    def flush(self):
-        self.i.flush()
-        self.a.flush()
-        self.r.flush()
-        self.d.flush()
-        self.ctx.flush()
-        self.nctx.flush()
-        self._save_meta()
+        if share_memory:
+            self.i.share_memory_()
+            self.a.share_memory_()
+            self.r.share_memory_()
+            self.d.share_memory_()
+            self.ctx.share_memory_()
+            self.nctx.share_memory_()
 
     def add(self, i, a, r, d, ctx, nctx):
         p = self.ptr
@@ -347,23 +333,44 @@ class ReplayBuffer:
         self.a[p] = int(a)
         self.r[p] = float(r)
         self.d[p] = float(d)
-        self.ctx[p] = ctx.astype(np.float32, copy=False)
-        self.nctx[p] = nctx.astype(np.float32, copy=False)
+
+        if isinstance(ctx, np.ndarray):
+            self.ctx[p].copy_(torch.from_numpy(ctx).to(dtype=torch.float32))
+        else:
+            self.ctx[p].copy_(ctx.to(device="cpu", dtype=torch.float32))
+
+        if isinstance(nctx, np.ndarray):
+            self.nctx[p].copy_(torch.from_numpy(nctx).to(dtype=torch.float32))
+        else:
+            self.nctx[p].copy_(nctx.to(device="cpu", dtype=torch.float32))
+
         self.ptr = (self.ptr + 1) % self.cap
         self.size = min(self.size + 1, self.cap)
 
-    def sample(self, batch: int):
-        idx = np.random.randint(0, self.size, size=int(batch))
-        return (
-            self.i[idx].copy(),
-            self.a[idx].copy(),
-            self.r[idx].copy(),
-            self.d[idx].copy(),
-            self.ctx[idx].copy(),
-            self.nctx[idx].copy(),
-        )
+    def state_dict(self) -> dict:
+        return {
+            "cap": int(self.cap),
+            "ctx_dim": int(self.ctx_dim),
+            "ptr": int(self.ptr),
+            "size": int(self.size),
+            "i": self.i,
+            "a": self.a,
+            "r": self.r,
+            "d": self.d,
+            "ctx": self.ctx,
+            "nctx": self.nctx,
+        }
 
-    def set_state(self, ptr: int, size: int):
-        self.ptr = int(ptr)
-        self.size = int(size)
-        self._save_meta()
+    def load_state_dict(self, sd: dict):
+        if int(sd["cap"]) != int(self.cap) or int(sd["ctx_dim"]) != int(self.ctx_dim):
+            raise RuntimeError("ReplayBuffer shape mismatch")
+
+        self.ptr = int(sd["ptr"])
+        self.size = int(sd["size"])
+
+        self.i.copy_(sd["i"])
+        self.a.copy_(sd["a"])
+        self.r.copy_(sd["r"])
+        self.d.copy_(sd["d"])
+        self.ctx.copy_(sd["ctx"])
+        self.nctx.copy_(sd["nctx"])
