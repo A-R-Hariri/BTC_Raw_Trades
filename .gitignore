@@ -5,3 +5,5 @@
 *.npy
 *.json
 /processed/BTCUSDT/replay_memmap/*
+logs.txt
+/processed/*

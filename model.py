@@ -17,25 +17,35 @@ class ScaleEncoder(nn.Module):
         self.seq_len = int(seq_len)
 
         self.conv1 = nn.Conv1d(self.d_in, self.hidden, kernel_size=8, padding="same")
-        self.conv2 = nn.Conv1d(self.hidden, self.hidden, kernel_size=4, padding="same")
+        self.conv2 = nn.Conv1d(self.hidden, self.hidden // 2, kernel_size=4, padding="same")
+        self.pool1 = nn.AvgPool1d(kernel_size=4)
+        self.pool2 = nn.AvgPool1d(kernel_size=2)
         self.drop = nn.Dropout(DROPOUT)
 
-        self.flat_dim = self.hidden * self.seq_len
+        self.flat_dim = self.hidden // 2 * self.seq_len // \
+                        (self.pool1.kernel_size[0] * self.pool2.kernel_size[0])
+        
         self.ln = nn.LayerNorm(self.flat_dim)
-        self.proj = nn.Linear(self.flat_dim, ENC_HIDDEN)
+        self.emb1 = nn.Linear(self.flat_dim, ENC_HIDDEN)
+        self.emb2 = nn.Linear(ENC_HIDDEN, HIDDEN)
 
     def forward(self, x):
         x = x.transpose(1, 2)  # [B, D, T]
         x = F.relu(self.conv1(x))
         x = self.drop(x)
+        x = self.pool1(x)
         x = F.relu(self.conv2(x))
         x = self.drop(x)
+        x = self.pool2(x)
 
         x = x.transpose(1, 2)  # [B, T, H]
         x = x.reshape(x.shape[0], -1)  # [B, T*H]  (FLATTEN instead of mean)
 
         x = self.ln(x)
-        x = self.proj(x)
+        x = self.emb1(x)
+        x = F.relu(x)
+        x = self.drop(x)
+        x = self.emb2(x)
         x = F.relu(x)
         return x
 
@@ -53,11 +63,11 @@ class EncStack(nn.Module):
         self.ctx = nn.Sequential(
             nn.Linear(self.ctx_in_dim, HIDDEN),
             nn.ReLU(),
-            nn.Linear(HIDDEN, ENC_HIDDEN),
+            nn.Linear(HIDDEN, HIDDEN),
             nn.ReLU(),
         )
 
-        self.z_dim = ENC_HIDDEN * 5
+        self.z_dim = HIDDEN * 5
 
     def forward(self, s250, s20, s5m, s1h, ctx):
         return torch.cat([

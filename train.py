@@ -82,7 +82,7 @@ def evaluate_policy(actor: nn.Module, stores, norm, start_lo: int, start_hi: int
         done = False
 
         while (not done) and (steps < total_steps):
-            a = select_action(actor, obs, device=device, deterministic=True)
+            a = select_action(actor, obs, device=device, deterministic=False)
             obs, r, done, info = env.step(a)
             sum_r += float(r)
             steps += 1
