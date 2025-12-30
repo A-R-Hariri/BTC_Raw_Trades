@@ -46,7 +46,7 @@ INIT_BALANCE = 100.0
 LEVERAGE = 1
 FEE_OPEN = 0.0004
 FEE_CLOSE = 0.0004
-LOSS_THRESHOLD_FRAC = 0.666 # Minimum realized balance fraction from peak
+LOSS_THRESHOLD_FRAC = 0.666 # Minimum balance 
 EPISODE_HOURS = 6.0
 VOTE_N = 256
 
